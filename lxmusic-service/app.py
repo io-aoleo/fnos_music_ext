@@ -858,6 +858,29 @@ async def _fill_script_meta(client: httpx.AsyncClient, src: str, item: dict, ide
         logger.warning("lx meta fill %s %s failed: %s", src, identifier, exc)
 
 
+
+def _cross_song_key(value: str) -> str:
+    text_value = re.sub(r"[（(].*?[)）]", "", str(value or "").lower())
+    text_value = re.sub(r"[\s\u3000]+", "", text_value)
+    return re.sub(r"[^\w\u4e00-\u9fff]+", "", text_value)
+
+
+def _cross_same_song(wanted_title: str, wanted_artist: str, got_title: str, got_artist: str = "") -> bool:
+    left = _cross_song_key(wanted_title)
+    right = _cross_song_key(got_title)
+    if not left or not right:
+        return False
+    if left != right:
+        short, long = (left, right) if len(left) <= len(right) else (right, left)
+        if len(short) < 2 or short not in long:
+            return False
+    want_artist = _cross_song_key(wanted_artist)
+    got = _cross_song_key(got_artist)
+    if want_artist and got and want_artist not in got and got not in want_artist:
+        return False
+    return True
+
+
 async def _resolve_and_probe(client: httpx.AsyncClient, src: str, item: dict,
                              tier: str = "standard", retained: dict | None = None) -> "dict | None":
     """Shared search/URL pipeline: user source musicUrl -> verify -> downgrade -> fallback to backup sources."""
@@ -962,8 +985,9 @@ async def _resolve_and_probe(client: httpx.AsyncClient, src: str, item: dict,
                         matched_items = await mg_search(client, query, limit=3)
 
                     for cand in matched_items:
-                        cand_title = str(cand.get("title") or "").lower().strip()
-                        if title.lower() in cand_title or cand_title in title.lower():
+                        cand_title = str(cand.get("title") or "")
+                        cand_artist = str(cand.get("artist") or cand.get("singer") or "")
+                        if _cross_same_song(title, artist, cand_title, cand_artist):
                             cand["_cross_fallback"] = True
                             fb_res = await _resolve_and_probe(client, fb_platform, cand, tier=tier, retained=retained)
                             if fb_res:

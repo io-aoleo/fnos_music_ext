@@ -76,7 +76,10 @@ ALL_CHARTS: list[dict[str, Any]] = KG_CHARTS + WY_CHARTS
 _CHART_MAP: dict[str, dict[str, Any]] = {c["id"]: c for c in ALL_CHARTS}
 
 # 内存快速缓存，避免高频并发重复拉取
-_MEM_CACHE: dict[str, tuple[float, list[dict]]] = {}
+# (写入时间, 数据日期 YYYYMMDD, 曲目)。日期不是今天的项只能兜底，不能当成当日新榜。
+_MEM_CACHE: dict[str, tuple[float, str, list[dict]]] = {}
+_FETCH_FAIL_AT: dict[str, float] = {}
+_FETCH_FAIL_TTL_S = 600.0
 _FETCH_LOCKS: dict[str, asyncio.Lock] = {}
 _CHART_COVERS: dict[str, str] = {}
 _CHART_TRACKS_BY_GUID: dict[str, dict] = {}
@@ -152,56 +155,81 @@ def _today() -> str:
     return datetime.now().strftime("%Y%m%d")
 
 
-def load_chart_cache(chart_id: str, day: str) -> list[dict] | None:
-    # 1. 查内存
+def _cache_day_from_name(chart_id: str, filename: str) -> str:
+    prefix = f"{chart_id}_"
+    if not filename.startswith(prefix) or not filename.endswith(".json"):
+        return ""
+    day = filename[len(prefix):-5]
+    return day if re.fullmatch(r"\d{8}", day) else ""
+
+
+def _load_chart_file(chart_id: str, path: str) -> list[dict] | None:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        logger.warning("Failed to load chart cache from %s: %s", path, e)
+        return None
+    tracks: list[dict] = []
+    if isinstance(data, dict):
+        raw = data.get("tracks") or []
+        tracks = raw if isinstance(raw, list) else []
+        cov = data.get("cover")
+        if cov:
+            _CHART_COVERS[chart_id] = str(cov)
+    elif isinstance(data, list):
+        tracks = data
+    if not tracks:
+        return None
+    _index_tracks(tracks)
+    return tracks
+
+
+def load_chart_cache(chart_id: str, day: str, *, allow_stale: bool = True) -> list[dict] | None:
+    """读取榜单缓存。只有当天数据能挡住重新拉取；历史文件只在抓取失败时兜底。"""
     mem = _MEM_CACHE.get(chart_id)
     if mem:
-        ts, data = mem
-        # 缓存有效 4 小时
-        if time.time() - ts < 14400 and data:
+        ts, mem_day, data = mem
+        if mem_day == day and data and time.time() - ts < 14400:
             _index_tracks(data)
             return data
 
-    # 2. 查本地文件（优先查当天文件，无当天文件时查最新历史缓存兜底，绝不丢数据）
-    target_path = _cache_file(chart_id, day)
-    paths_to_try = [target_path]
-    if not os.path.exists(target_path):
-        try:
-            cdir = _cache_dir()
-            prefix = f"{chart_id}_"
-            candidates = sorted(
-                [os.path.join(cdir, fn) for fn in os.listdir(cdir) if fn.startswith(prefix) and fn.endswith(".json")],
-                reverse=True
-            )
-            paths_to_try.extend(candidates)
-        except Exception:
-            pass
+    today_path = _cache_file(chart_id, day)
+    if os.path.exists(today_path):
+        today_tracks = _load_chart_file(chart_id, today_path)
+        if today_tracks:
+            _MEM_CACHE[chart_id] = (time.time(), day, today_tracks)
+            return today_tracks
 
-    for path in paths_to_try:
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    tracks = data.get("tracks") or []
-                    cov = data.get("cover")
-                    if cov:
-                        _CHART_COVERS[chart_id] = str(cov)
-                    if tracks:
-                        _MEM_CACHE[chart_id] = (time.time(), tracks)
-                        _index_tracks(tracks)
-                        return tracks
-                elif isinstance(data, list) and data:
-                    _MEM_CACHE[chart_id] = (time.time(), data)
-                    _index_tracks(data)
-                    return data
-            except Exception as e:
-                logger.warning("Failed to load chart cache from %s: %s", path, e)
+    if not allow_stale:
+        return None
+
+    if mem and mem[2]:
+        _index_tracks(mem[2])
+        return mem[2]
+
+    try:
+        cdir = _cache_dir()
+        prefix = f"{chart_id}_"
+        names = sorted(
+            [fn for fn in os.listdir(cdir) if fn.startswith(prefix) and fn.endswith(".json")],
+            reverse=True,
+        )
+    except Exception:
+        return None
+    for fn in names:
+        file_day = _cache_day_from_name(chart_id, fn)
+        if not file_day or file_day == day:
+            continue
+        tracks = _load_chart_file(chart_id, os.path.join(cdir, fn))
+        if tracks:
+            _MEM_CACHE[chart_id] = (time.time(), file_day, tracks)
+            return tracks
     return None
 
 
 def save_chart_cache(chart_id: str, day: str, tracks: list[dict], cover_url: str = "") -> None:
-    _MEM_CACHE[chart_id] = (time.time(), tracks)
+    _MEM_CACHE[chart_id] = (time.time(), day, tracks)
     if cover_url:
         _CHART_COVERS[chart_id] = cover_url
     _index_tracks(tracks)
@@ -295,7 +323,7 @@ async def fetch_kg_chart(client: httpx.AsyncClient, rankid: int, limit: int = 10
                 for a in authors
                 if isinstance(a, dict) and a.get("author_name")
             )
-            title = str(it.get("songname") or it.get("filename") or "").replace(f"{singer} - ", "").strip()
+            title = _clean_kg_title(str(it.get("songname") or it.get("filename") or ""), singer)
             if not title:
                 continue
             cover = str(it.get("album_sizable_cover") or "").replace("{size}", "480")
@@ -399,15 +427,18 @@ async def get_or_load_chart_tracks(
         return []
 
     day = _today()
-    cached = load_chart_cache(chart_id, day)
+    cached = load_chart_cache(chart_id, day, allow_stale=False)
     if cached:
         return cached
 
     lock = _FETCH_LOCKS.setdefault(chart_id, asyncio.Lock())
     async with lock:
-        cached = load_chart_cache(chart_id, day)
+        cached = load_chart_cache(chart_id, day, allow_stale=False)
         if cached:
             return cached
+        failed_at = _FETCH_FAIL_AT.get(chart_id, 0.0)
+        if time.time() - failed_at < _FETCH_FAIL_TTL_S:
+            return load_chart_cache(chart_id, day, allow_stale=True) or []
 
         owned_client = False
         if client is None:
@@ -422,11 +453,32 @@ async def get_or_load_chart_tracks(
                 tracks, cover_url = await fetch_wy_chart(client, meta["toplist_id"], netease_enabled=netease_enabled, limit=limit)
 
             if tracks:
+                _FETCH_FAIL_AT.pop(chart_id, None)
                 save_chart_cache(chart_id, day, tracks, cover_url=cover_url)
-            return tracks
+                return tracks
+            _FETCH_FAIL_AT[chart_id] = time.time()
+            return load_chart_cache(chart_id, day, allow_stale=True) or []
         finally:
             if owned_client:
                 await client.aclose()
+
+
+
+def _clean_kg_title(raw_title: str, singer: str) -> str:
+    """只去掉歌名开头的「歌手 - 」前缀。歌手为空时不能把标题里的连字符吃掉。"""
+    title = str(raw_title or "").strip()
+    singer = str(singer or "").strip()
+    prefix = f"{singer} - " if singer else ""
+    if prefix and title.startswith(prefix):
+        return title[len(prefix):].strip()
+    return title
+
+
+def chart_track_page(tracks: list[dict], page: int, size: int = 50) -> list[dict]:
+    """榜单第 1 页返回整表。后续页必须为空，避免客户端按 size 翻页时把后半段再追加一遍。"""
+    if page <= 1 or size == -1:
+        return list(tracks or [])
+    return []
 
 
 def build_chart_playlist_record(chart_id: str, track_count: int = 0) -> dict[str, Any]:
@@ -507,7 +559,7 @@ async def warmup_charts_background(enabled_charts: list[dict[str, Any]], netease
                 # 若今日缓存已存在且在内存，跳过
                 mem = _MEM_CACHE.get(cid)
                 target_path = _cache_file(cid, day)
-                if mem and os.path.exists(target_path):
+                if mem and mem[1] == day and os.path.exists(target_path):
                     continue
                 try:
                     await get_or_load_chart_tracks(cid, client=client, netease_enabled=netease_enabled)

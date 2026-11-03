@@ -4377,6 +4377,71 @@ async def _recover_source(request: Request, guid: str, entry: dict | None) -> bo
         _FETCH_SCOPE.reset(token)
 
 
+
+def _song_match_key(value: str) -> str:
+    text_value = re.sub(r"[（(].*?[)）]", "", str(value or "").lower())
+    text_value = re.sub(r"[\s\u3000]+", "", text_value)
+    return re.sub(r"[^\w\u4e00-\u9fff]+", "", text_value)
+
+
+def same_song_identity(wanted_title: str, wanted_artist: str, got_title: str, got_artist: str = "") -> bool:
+    """换源时只接受歌名相符、歌手不冲突的结果，避免搜索第一条把别的歌播出来。"""
+    left = _song_match_key(wanted_title)
+    right = _song_match_key(got_title)
+    if not left or not right:
+        return False
+    if left != right:
+        short, long = (left, right) if len(left) <= len(right) else (right, left)
+        if len(short) < 2 or short not in long:
+            return False
+    want_artist = _song_match_key(wanted_artist)
+    got = _song_match_key(got_artist)
+    if want_artist and got and want_artist not in got and got not in want_artist:
+        return False
+    return True
+
+
+def _joined_names(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        return ""
+    names = []
+    for item in value:
+        if isinstance(item, dict):
+            names.append(str(item.get("name") or item.get("author_name") or ""))
+        elif item:
+            names.append(str(item))
+    return " / ".join(name for name in names if name)
+
+
+def first_same_song(
+    songs: list,
+    wanted_title: str,
+    wanted_artist: str,
+    *,
+    title_keys: tuple[str, ...],
+    artist_keys: tuple[str, ...],
+) -> dict | None:
+    for song in songs or []:
+        if not isinstance(song, dict):
+            continue
+        got_title = ""
+        for key in title_keys:
+            if song.get(key):
+                got_title = str(song.get(key))
+                break
+        got_artist = ""
+        for key in artist_keys:
+            if song.get(key):
+                got_artist = _joined_names(song.get(key))
+                if got_artist:
+                    break
+        if same_song_identity(wanted_title, wanted_artist, got_title, got_artist):
+            return song
+    return None
+
+
 async def _open_online_stream(request: Request, guid: str, range_header: str | None,
                               force_mp3: bool = False):
     """Resolve and read first bytes before committing HTTP headers to the client."""
@@ -4447,8 +4512,13 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                                 )
                                 if sr.status_code == 200:
                                     s_songs = ((sr.json() or {}).get("result") or {}).get("songs") or []
-                                    if s_songs and isinstance(s_songs[0], dict) and s_songs[0].get("id"):
-                                        wy_sid = str(s_songs[0]["id"])
+                                    picked = first_same_song(
+                                        s_songs, title, artist,
+                                        title_keys=("name", "title"),
+                                        artist_keys=("artists", "ar", "artist"),
+                                    )
+                                    if picked and picked.get("id"):
+                                        wy_sid = str(picked["id"])
                                         # 若开启了网易盒子，优先走盒子端点
                                         if bool(CONF.get("netease_enabled")):
                                             mb_client = get_musicbox_client(request.app)
@@ -4504,8 +4574,13 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                                     if tr.status_code == 200:
                                         t_data = tr.json() or {}
                                         t_list = ((((t_data.get("req_1") or {}).get("data") or {}).get("body") or {}).get("song") or {}).get("list") or []
-                                        if t_list and isinstance(t_list[0], dict) and (t_list[0].get("mid") or t_list[0].get("songmid")):
-                                            tx_mid = str(t_list[0].get("mid") or t_list[0].get("songmid"))
+                                        picked = first_same_song(
+                                            t_list, title, artist,
+                                            title_keys=("name", "title", "songname"),
+                                            artist_keys=("singer", "artist"),
+                                        )
+                                        if picked and (picked.get("mid") or picked.get("songmid")):
+                                            tx_mid = str(picked.get("mid") or picked.get("songmid"))
                                             lx_c = get_lx_client(request.app)
                                             alt_resolved = await resolve_lx_url(
                                                 lx_c,
@@ -4533,7 +4608,15 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                                     s_items = (sr.json() or {}).get("items") or []
                                     for sit in s_items:
                                         stid = str(sit.get("id") or "")
-                                        if stid and stid != guid:
+                                        if not stid or stid == guid:
+                                            continue
+                                        if not same_song_identity(
+                                            title, artist,
+                                            str(sit.get("title") or sit.get("name") or ""),
+                                            str(sit.get("artist") or sit.get("singer") or ""),
+                                        ):
+                                            continue
+                                        if stid:
                                             alt_resolved = await resolve_lx_url(
                                                 lx_c,
                                                 stid,
@@ -8487,12 +8570,8 @@ async def playlist_track_list(request: Request):
             size = int(request.query_params.get("size") or 50)
         except (TypeError, ValueError):
             size = 50
-        # 榜单歌单直接在首屏整页全量交付（最多 100 首），无需下拉翻页
-        if page == 1:
-            page_tracks = tracks
-        else:
-            start = (page - 1) * size
-            page_tracks = tracks[start:start + size] if start < len(tracks) else []
+        # 第 1 页已经整表返回。再按 size 切第 2 页会把后半段重复追加。
+        page_tracks = charts.chart_track_page(tracks, page, size)
 
         online_favs = await _online_favorite_set(request)
         _, db_paths, db_tags = official_favorites_cache()
