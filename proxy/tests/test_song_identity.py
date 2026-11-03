@@ -23,3 +23,11 @@ def test_first_same_song_skips_unrelated_top_hit():
         songs, "\u6674\u5929", "\u9648\u5955\u8fc5",
         title_keys=("name",), artist_keys=("artists",),
     ) is None
+
+
+def test_same_song_rejects_title_substring_and_artist_prefix():
+    assert same_song_identity("晴天", "周杰伦", "晴天 Live", "周杰伦")
+    assert same_song_identity("晴天", "周杰伦", "晴天", "周杰伦 / 方文山")
+    assert not same_song_identity("晴天", "周杰伦", "晴天娃娃", "周杰伦")
+    assert not same_song_identity("晴天", "周杰", "晴天", "周杰伦")
+    assert not same_song_identity("go", "", "good morning", "")

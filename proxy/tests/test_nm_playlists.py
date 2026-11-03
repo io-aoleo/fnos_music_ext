@@ -92,6 +92,7 @@ def setup_nm_env(tmp_path, monkeypatch):
     # 关闭推荐注入，聚焦 nm 歌单行为（注入位置断言不依赖推荐构建链）
     monkeypatch.setitem(CONF, "recommend_hot", False)
     monkeypatch.setitem(CONF, "recommend_daily", False)
+    monkeypatch.setitem(CONF, "recommend_charts", False)
     yield
     nmpl.reset_for_test()
 
@@ -221,7 +222,7 @@ def test_cover_redirect():
         fake = fake_official_guid("online:playlist:nm:111")
         resp = client.get("/music/api/v1/static/cover", params={"coverId": f"track_{fake}"}, follow_redirects=False)
         assert resp.status_code == 302
-        assert resp.headers["location"] == "http://img/111.jpg"
+        assert resp.headers["location"] == "https://img/111.jpg"
         # 无封面直链的私歌单：404（客户端回落默认样式）
         fake333 = fake_official_guid("online:playlist:nm:333")
         resp = client.get("/music/api/v1/static/cover", params={"coverId": f"track_{fake333}"}, follow_redirects=False)
@@ -273,3 +274,25 @@ def test_summaries_cached_in_memory():
         client.get("/music/api/v1/playlist/list")
         client.get("/music/api/v1/playlist/list")
     assert mb.state["calls"] == 1  # 5 分钟 TTL 内命中内存缓存
+
+
+def test_transport_cooldown_keeps_disk_cards():
+    """网络失败冷却期内不能把已经落盘的歌单丢掉；未登录冷却则不回放磁盘。"""
+    import asyncio
+    import time
+
+    cards = [{"guid": "online:playlist:nm:111", "name": "我喜欢的音乐", "trackCount": 1}]
+    nmpl._persist_summaries(cards, {111: "http://img/111.jpg"})
+    nmpl._summaries = None
+    nmpl._disk_cards = None
+    nmpl._fail_until = time.monotonic() + 60
+    nmpl._fail_from_transport = True
+    got = asyncio.run(nmpl.peek_summaries(None))
+    assert [c["guid"] for c in got] == ["online:playlist:nm:111"]
+
+    nmpl._summaries = None
+    nmpl._disk_cards = None
+    nmpl._fail_from_transport = False
+    nmpl._fail_until = time.monotonic() + 60
+    assert asyncio.run(nmpl.peek_summaries(None)) == []
+

@@ -471,7 +471,7 @@ def test_circuit_recovery_on_open_expiry(isolated):
     import asyncio
 
     result = asyncio.run(run())
-    assert result is not None and result["resolver"] == "user_source"
+    assert result is not None and result["resolver"] == "user_source_0"
     snap = lxapp.chain_health_snapshot()
     assert snap["user_source"]["state"] == "closed"  # half_open 试探成功后闭合
 

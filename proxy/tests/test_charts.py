@@ -192,5 +192,49 @@ class TestCharts(unittest.TestCase):
 
 
 
+    def test_same_day_cache_expires(self):
+        import asyncio
+
+        self._isolate_charts()
+        old_fetch = charts.fetch_kg_chart
+        calls = {"n": 0}
+
+        async def fake_fetch(client, rankid, limit=100):
+            calls["n"] += 1
+            return ([{"id": "lx:kg:fresh", "source": "lx", "title": "刷新后", "artist": "甲"}], "")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_dir = os.environ.get("FNMUSIC_RECOMMEND_DIR")
+            os.environ["FNMUSIC_RECOMMEND_DIR"] = tmpdir
+            charts.fetch_kg_chart = fake_fetch
+            try:
+                stale = [{"id": "lx:kg:old", "source": "lx", "title": "四小时前", "artist": "乙"}]
+                charts.save_chart_cache("kg_8888", charts._today(), stale)
+                path = charts._cache_file("kg_8888", charts._today())
+                old_ts = __import__("time").time() - charts._CHART_FRESH_S - 60
+                os.utime(path, (old_ts, old_ts))
+                charts._MEM_CACHE.clear()
+                self.assertIsNone(charts.load_chart_cache("kg_8888", charts._today(), allow_stale=False))
+                fallback = charts.load_chart_cache("kg_8888", charts._today(), allow_stale=True)
+                self.assertEqual(fallback[0]["title"], "四小时前")
+                charts._MEM_CACHE.clear()
+
+                async def run():
+                    class Dummy:
+                        pass
+                    got = await charts.get_or_load_chart_tracks("kg_8888", client=Dummy(), limit=10)
+                    self.assertEqual(got[0]["title"], "刷新后")
+
+                asyncio.run(run())
+                self.assertEqual(calls["n"], 1)
+            finally:
+                charts.fetch_kg_chart = old_fetch
+                if old_dir is not None:
+                    os.environ["FNMUSIC_RECOMMEND_DIR"] = old_dir
+                else:
+                    os.environ.pop("FNMUSIC_RECOMMEND_DIR", None)
+                self._restore_charts()
+
+
 if __name__ == "__main__":
     unittest.main()

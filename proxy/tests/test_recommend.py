@@ -30,6 +30,7 @@ def setup_recommend_env(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "cache_dir", cache_dir)
     monkeypatch.setitem(CONF, "musicdl_enabled", True)
     monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.setitem(CONF, "recommend_charts", False)
     monkeypatch.delenv("FNMUSIC_LLM_API_KEY", raising=False)
     monkeypatch.delenv("FNMUSIC_LLM_BASE_URL", raising=False)
     # lxmusic 客户端默认 mock（404），防止每日推荐链路在测试中触达真实 127.0.0.1:8772
@@ -717,10 +718,12 @@ async def test_get_or_build_daily_uses_llm_when_netease_disabled(monkeypatch):
         if request.url.path == "/stream":
             return httpx.Response(200, headers={"content-type": "audio/mpeg"}, content=b"ID3")
         kw = request.url.params.get("keyword") or ""
-        title = kw.split()[-1] if kw else "x"
+        parts = kw.split()
+        title = parts[-1] if parts else "x"
+        artist = " ".join(parts[:-1])
         return httpx.Response(
             200,
-            json={"items": [{"id": f"migu:{abs(hash(kw)) % 100000}", "source": "migu", "title": title, "artist": "A", "duration_s": 180, "ext": "mp3"}]},
+            json={"items": [{"id": f"migu:{abs(hash(kw)) % 100000}", "source": "migu", "title": title, "artist": artist, "duration_s": 180, "ext": "mp3"}]},
         )
 
     from proxy.app import build_online_track
@@ -841,7 +844,7 @@ async def test_hot_playlist_uses_netease_charts(tmp_path, monkeypatch):
     assert all(str(t["guid"]).startswith("online:netease:") for t in payload["tracks"])
     # 封面 = 第一个有 cover_url 的歌（第一首在列）
     assert payload["playlist"]["coverId"] == payload["tracks"][0]["guid"]
-    assert str(payload["tracks"][0].get("cover_url") or "").startswith("http://img/70000")
+    assert str(payload["tracks"][0].get("cover_url") or "").startswith("https://img/70000")
 
 
 @pytest.mark.anyio
@@ -1045,10 +1048,11 @@ async def test_resolve_recommendations_concurrency_and_throttle(monkeypatch):
             await asyncio.sleep(0.02)
         finally:
             active -= 1
+            title = keyword[len("Artist "):] if keyword.startswith("Artist ") else keyword
             return [{
-                "id": f"netease:{keyword}",
+                "id": f"netease:{title}",
                 "source": "netease",
-                "title": keyword,
+                "title": title,
                 "artist": "Artist",
                 "album": "Album",
                 "duration_s": 200,
@@ -1290,7 +1294,7 @@ async def test_resolve_recommendations_emits_progressively(monkeypatch):
         kw = request.url.params.get("keyword") or "歌"
         return httpx.Response(200, json={"ok": True, "items": [{
             "id": f"migu:{abs(hash(kw)) % 9999}", "source": "migu",
-            "title": kw.split()[-1], "artist": "A", "duration_s": 200, "ext": "mp3",
+            "title": kw.split()[-1], "artist": " ".join(kw.split()[:-1]), "duration_s": 200, "ext": "mp3",
         }]})
 
     async with httpx.AsyncClient(
@@ -1454,10 +1458,12 @@ async def test_daily_case3_source_slot_first_netease_others_llm(tmp_path, monkey
         if request.url.path == "/stream":
             return httpx.Response(200, headers={"content-type": "audio/mpeg"}, content=b"ID3")
         kw = request.url.params.get("keyword") or ""
-        title = kw.split()[-1] if kw else "x"
+        parts = kw.split()
+        title = parts[-1] if parts else "x"
+        artist = " ".join(parts[:-1])
         return httpx.Response(200, json={"items": [{
             "id": f"migu:{abs(hash(kw)) % 100000}", "source": "migu",
-            "title": title, "artist": "A", "duration_s": 180, "ext": "mp3",
+            "title": title, "artist": artist, "duration_s": 180, "ext": "mp3",
         }]})
 
     from proxy.app import build_online_track
@@ -1623,3 +1629,63 @@ def test_playlist_list_serves_partial_checkpoint_progressively(tmp_path, monkeyp
         assert first["trackCount"] >= 1
         # 未等完整构建（完整结束需 ~2.1s，peek 窗口 2s；命中 checkpoint 应明显更早）
         assert elapsed < 1.8, f"应命中渐进 checkpoint 提前返回，实际等了 {elapsed:.2f}s"
+
+
+@pytest.mark.anyio
+async def test_resolve_recommendations_rejects_different_song(monkeypatch):
+    """检索第一条如果不是这首歌，不能进推荐。"""
+    async def wrong(keyword, *args, **kwargs):
+        return [{
+            "id": "netease:1", "source": "netease",
+            "title": "七里香", "artist": "周杰伦", "duration_s": 200, "ext": "mp3",
+        }]
+
+    async def right(keyword, *args, **kwargs):
+        return [{
+            "id": "netease:2", "source": "netease",
+            "title": "晴天", "artist": "周杰伦", "duration_s": 200, "ext": "mp3",
+        }]
+
+    monkeypatch.setattr(dailyrec, "verify_playable_enabled", lambda: False)
+    monkeypatch.setattr(dailyrec, "_search_keyword", wrong)
+    recs = [{"title": "晴天", "artist": "周杰伦"}]
+
+    def build(pick):
+        return {"guid": "online:" + pick["id"], "title": pick["title"], "artist": pick["artist"]}
+
+    out = await dailyrec.resolve_recommendations(recs, None, None, True, build)
+    assert out == []
+    monkeypatch.setattr(dailyrec, "_search_keyword", right)
+    out = await dailyrec.resolve_recommendations(recs, None, None, True, build)
+    assert [it["title"] for it in out] == ["晴天"]
+
+
+def test_playlist_list_does_not_double_count_echoed_recommend(tmp_path, monkeypatch):
+    """上游如果回显了推荐 guid，过滤后不能再把总数加一遍。"""
+    monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
+    monkeypatch.setitem(CONF, "recommend_daily", False)
+    monkeypatch.setitem(CONF, "recommend_hot", True)
+    hot_guid = _seed_recommend_cache("user-rec-1", "hot", ["热歌1"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/user/me"):
+            return httpx.Response(200, json={"code": 0, "data": {"guid": "user-rec-1"}})
+        if path.endswith("/playlist/list"):
+            return httpx.Response(200, json={"code": 0, "data": {
+                "list": [
+                    {"guid": hot_guid, "name": "echo"},
+                    {"guid": "localpl", "name": "牛一"},
+                ],
+                "total": 2,
+            }})
+        return httpx.Response(200, json={"code": 0, "data": None})
+
+    app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://unix")
+    with TestClient(app) as client:
+        data = client.get("/music/api/v1/playlist/list").json()["data"]
+    guids = [it["guid"] for it in data["list"]]
+    assert guids.count(hot_guid) == 1
+    assert "localpl" in guids
+    assert data["total"] == len(data["list"]) == 2
+

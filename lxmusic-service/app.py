@@ -228,6 +228,17 @@ def _quality_tiers(quality: str) -> list[str]:
 
 # ------------------------------------------------------------------ 酷狗 kg ---
 
+
+def _strip_leading_artist(title: str, artist: str) -> str:
+    """只去掉歌名开头的「歌手 - 」。歌手为空时不能把标题里的连字符吃掉。"""
+    text = str(title or "").strip()
+    artist = str(artist or "").strip()
+    prefix = f"{artist} - " if artist else ""
+    if prefix and text.startswith(prefix):
+        return text[len(prefix):].strip()
+    return text
+
+
 async def kg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict]:
     # 检索更多条目以便剔除收费/VIP曲目后仍能满足 limit 数量
     fetch_size = max(limit * 3, 20)
@@ -263,7 +274,7 @@ async def kg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
             continue
 
         singer = str(it.get("singername") or "")
-        title = str(it.get("songname") or it.get("filename") or "").replace(f"{singer} - ", "")
+        title = _strip_leading_artist(str(it.get("songname") or it.get("filename") or ""), singer)
         # 3. 标题带有试听片段标记的坚决不返回
         if any(marker in title for marker in _TRIAL_TITLE_MARKERS):
             continue
@@ -654,6 +665,27 @@ def _chain_acquire(name: str) -> bool:
     return True
 
 
+def _recorded_slot_circuits(slot: int) -> list[str]:
+    names = [f"user_source_{slot}"]
+    if slot == 0:
+        names.append("user_source")
+    return [name for name in names if name in _CHAIN_HEALTH]
+
+
+def _slot_circuits_available(slot: int) -> bool:
+    """槽位是否还能放行。只看已经记过的熔断；空的旧键不能把打开的熔断冲掉。"""
+    return all(_chain_available(name) for name in _recorded_slot_circuits(slot))
+
+
+def _slot_acquire(slot: int) -> bool:
+    recorded = _recorded_slot_circuits(slot)
+    if any(not _chain_available(name) for name in recorded):
+        return False
+    for name in recorded:
+        _chain_acquire(name)
+    return True
+
+
 def _chain_report(name: str, ok: bool) -> None:
     h = _CHAIN_HEALTH.setdefault(name, {"fails": 0, "open_until": 0.0, "breaks": 0})
     was_half_open = h.pop("half_open", False)
@@ -697,8 +729,7 @@ def source_capabilities() -> dict:
         qualitys: list[str] = []
         for slot, r in current_runtimes():
             if src in r.platforms:
-                cname = f"user_source_{slot}"
-                if _chain_available(cname) or (slot == 0 and _chain_available("user_source")):
+                if _slot_circuits_available(slot):
                     available = True
                 for q in r.qualitys(src):
                     if q not in qualitys:
@@ -865,20 +896,42 @@ def _cross_song_key(value: str) -> str:
     return re.sub(r"[^\w\u4e00-\u9fff]+", "", text_value)
 
 
-def _cross_same_song(wanted_title: str, wanted_artist: str, got_title: str, got_artist: str = "") -> bool:
-    left = _cross_song_key(wanted_title)
-    right = _cross_song_key(got_title)
+_CROSS_VERSION_MARKERS = (
+    "live", "remix", "cover", "acoustic", "instrumental", "inst",
+    "radio", "edit", "version", "ver", "mix", "dj",
+    "伴奏", "现场", "翻唱", "原唱", "纯音乐", "版",
+)
+_CROSS_ARTIST_SPLIT = re.compile(r"\s*(?:/|、|&|\||,|，|;|；| feat\.? | ft\.? )\s*", re.I)
+
+
+def _cross_titles(wanted: str, got: str) -> bool:
+    left = _cross_song_key(wanted)
+    right = _cross_song_key(got)
     if not left or not right:
         return False
-    if left != right:
-        short, long = (left, right) if len(left) <= len(right) else (right, left)
-        if len(short) < 2 or short not in long:
-            return False
-    want_artist = _cross_song_key(wanted_artist)
-    got = _cross_song_key(got_artist)
-    if want_artist and got and want_artist not in got and got not in want_artist:
+    if left == right:
+        return True
+    short, long = (left, right) if len(left) <= len(right) else (right, left)
+    if len(short) < 2 or not long.startswith(short):
         return False
-    return True
+    extra = long[len(short):]
+    return any(marker in extra for marker in _CROSS_VERSION_MARKERS)
+
+
+def _cross_artist_tokens(value: str) -> set[str]:
+    out: set[str] = set()
+    for part in _CROSS_ARTIST_SPLIT.split(str(value or "")):
+        key = _cross_song_key(part)
+        if len(key) >= 2:
+            out.add(key)
+    return out
+
+
+def _cross_same_song(wanted_title: str, wanted_artist: str, got_title: str, got_artist: str = "") -> bool:
+    left = _cross_artist_tokens(wanted_artist)
+    right = _cross_artist_tokens(got_artist)
+    artists_ok = (not left or not right) or bool(left & right)
+    return _cross_titles(wanted_title, got_title) and artists_ok
 
 
 async def _resolve_and_probe(client: httpx.AsyncClient, src: str, item: dict,
@@ -906,7 +959,7 @@ async def _resolve_and_probe(client: httpx.AsyncClient, src: str, item: dict,
     for slot, runtime in candidates:
         circuit_name = f"user_source_{slot}"
         # 兼容旧 circuit 命名
-        if not _chain_acquire(circuit_name) and not (slot == 0 and _chain_acquire("user_source")):
+        if not _slot_acquire(slot):
             _record_failure(ChainTransportError(f"user source slot {slot} circuit open"))
             continue
         recovering = bool(_CHAIN_HEALTH.get(circuit_name, {}).get("half_open"))
@@ -1327,7 +1380,7 @@ async def kg_chart_songs(client: httpx.AsyncClient, limit: int) -> list[dict]:
             for a in (it.get("authors") or [])
             if isinstance(a, dict) and a.get("author_name")
         )
-        title = str(it.get("songname") or it.get("filename") or "").replace(f"{singer} - ", "")
+        title = _strip_leading_artist(str(it.get("songname") or it.get("filename") or ""), singer)
         if not title or any(marker in title for marker in _TRIAL_TITLE_MARKERS):
             continue
         pay_type = int(it.get("pay_type") or 0)

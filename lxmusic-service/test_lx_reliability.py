@@ -100,7 +100,7 @@ def test_failed_upgrade_tier_not_cached_as_exhausted(isolated):
 
 def test_half_open_failure_reopens(isolated):
     """恢复试探（half_open）失败立即重新熔断，不允许第二次试探。"""
-    lxapp._CHAIN_HEALTH["user_source"] = {"fails": 0, "open_until": time.time() - 1, "breaks": 1}
+    lxapp._CHAIN_HEALTH["user_source_0"] = {"fails": 0, "open_until": time.time() - 1, "breaks": 1}
     rt = FakeRuntime(resolver=SourceError("resolve", "still broken"))
     isolated._runtime = rt
 
@@ -185,3 +185,13 @@ def test_resolve_and_probe_skips_trial_items(isolated):
 
     assert asyncio.run(run()) is None
     assert rt.calls == []
+
+
+def test_kg_title_and_cross_match_do_not_grab_another_song():
+    assert lxapp._strip_leading_artist("周杰伦 - 晴天", "") == "周杰伦 - 晴天"
+    assert lxapp._strip_leading_artist("周杰伦 - 晴天", "周杰伦") == "晴天"
+    assert lxapp._strip_leading_artist("晴天 - 回忆版", "周杰伦") == "晴天 - 回忆版"
+    assert lxapp._cross_same_song("晴天", "周杰伦", "晴天 Live", "周杰伦")
+    assert not lxapp._cross_same_song("晴天", "周杰伦", "晴天娃娃", "周杰伦")
+    assert not lxapp._cross_same_song("晴天", "周杰", "晴天", "周杰伦")
+

@@ -88,20 +88,47 @@ class FakeManager:
 
     def __init__(self, runtime=None, url="", seed="", last_error=""):
         self._runtime = runtime
-        self.active_url = url
         self.seed_url = seed
         self.last_error = last_error
         tmp = Path(tempfile.gettempdir())
         self.state_path = tmp / "lx-state-test.json"
         self.script_cache = tmp / "lx-source-test.js"
+        self._extra_script_caches = [
+            tmp / "lx-source-test-1.js",
+            tmp / "lx-source-test-2.js",
+        ]
         self.activated: list[str] = []
         self.shut_down = 0
+        self.active_urls = [url, "", ""]
+        self.seed_urls = [seed, "", ""]
+        self.last_errors = [last_error, "", ""]
+        self.state_dir = tmp
+
+    @property
+    def active_url(self) -> str:
+        return self.active_urls[0] if self.active_urls else ""
+
+    @active_url.setter
+    def active_url(self, value: str) -> None:
+        if not self.active_urls:
+            self.active_urls = ["", "", ""]
+        self.active_urls[0] = value
+
+    @property
+    def script_caches(self):
+        return [self.script_cache, *self._extra_script_caches]
 
     def get(self):
         runtime = self._runtime
         if runtime is not None and getattr(runtime, "running", True):
             return runtime
         return None
+
+    def get_runtimes(self):
+        runtime = self.get()
+        if runtime is None:
+            return []
+        return [(0, runtime)]
 
     def describe(self) -> dict:
         runtime = self.get()
@@ -120,11 +147,22 @@ class FakeManager:
         self.shut_down += 1
         self._runtime = None
 
-    async def activate(self, url: str):
-        if "bad-source" in url:
+    async def deactivate(self, slot: int = 0) -> None:
+        if slot == 0:
+            self._runtime = None
+            self.active_url = ""
+        if 0 <= slot < len(self.active_urls):
+            self.active_urls[slot] = ""
+
+    async def activate(self, url: str, slot: int = 0, *, script: str | None = None):
+        if "bad-source" in (url or ""):
             raise SourceError("download", "下载失败: boom")
         self.activated.append(url)
         self.active_url = url
+        if 0 <= slot < len(self.active_urls):
+            self.active_urls[slot] = url
+        self.last_slot = slot
+        self.last_script = script
 
 
 @pytest.fixture(autouse=True)

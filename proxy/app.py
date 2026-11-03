@@ -1896,8 +1896,13 @@ async def resolve_online_lyric(request: Request, guid: str) -> str:
                     )
                     if sr.status_code == 200:
                         songs = ((sr.json() or {}).get("result") or {}).get("songs") or []
-                        if songs and isinstance(songs[0], dict) and songs[0].get("id"):
-                            wy_sid = str(songs[0]["id"])
+                        picked = first_same_song(
+                            songs, title, artist,
+                            title_keys=("name", "title"),
+                            artist_keys=("artists", "ar", "artist"),
+                        )
+                        if picked and picked.get("id"):
+                            wy_sid = str(picked["id"])
                             lr2 = await http_client.get(
                                 "https://music.163.com/api/song/lyric",
                                 params={"id": wy_sid, "lv": 1, "tv": -1},
@@ -4378,27 +4383,9 @@ async def _recover_source(request: Request, guid: str, entry: dict | None) -> bo
 
 
 
-def _song_match_key(value: str) -> str:
-    text_value = re.sub(r"[（(].*?[)）]", "", str(value or "").lower())
-    text_value = re.sub(r"[\s\u3000]+", "", text_value)
-    return re.sub(r"[^\w\u4e00-\u9fff]+", "", text_value)
-
-
 def same_song_identity(wanted_title: str, wanted_artist: str, got_title: str, got_artist: str = "") -> bool:
     """换源时只接受歌名相符、歌手不冲突的结果，避免搜索第一条把别的歌播出来。"""
-    left = _song_match_key(wanted_title)
-    right = _song_match_key(got_title)
-    if not left or not right:
-        return False
-    if left != right:
-        short, long = (left, right) if len(left) <= len(right) else (right, left)
-        if len(short) < 2 or short not in long:
-            return False
-    want_artist = _song_match_key(wanted_artist)
-    got = _song_match_key(got_artist)
-    if want_artist and got and want_artist not in got and got not in want_artist:
-        return False
-    return True
+    return dailyrec.same_song(wanted_title, wanted_artist, got_title, got_artist)
 
 
 def _joined_names(value: Any) -> str:
@@ -8277,13 +8264,21 @@ async def playlist_list(request: Request):
         if nm_cards:
             nmpl.schedule_prefetch(get_musicbox_client(request.app), build_online_track, nm_cards)
 
-    official = [
-        it for it in official
-        if not (isinstance(it, dict) and dailyrec.is_recommend_playlist_guid(str(it.get("guid") or "")))
-    ]
+    raw_official = official if isinstance(official, list) else []
+    removed = 0
+    official = []
+    for it in raw_official:
+        if isinstance(it, dict) and dailyrec.is_recommend_playlist_guid(str(it.get("guid") or "")):
+            removed += 1
+            continue
+        official.append(it)
     data["list"] = recs + nm_cards + chart_cards + official
     total = data.get("total")
-    data["total"] = (total if isinstance(total, int) else len(official)) + len(recs) + len(nm_cards) + len(chart_cards)
+    if isinstance(total, int):
+        base = max(0, total - removed)
+    else:
+        base = len(official)
+    data["total"] = base + len(recs) + len(nm_cards) + len(chart_cards)
     return JSONResponse(content=envelope, headers=headers)
 
 

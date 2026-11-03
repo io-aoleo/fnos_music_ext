@@ -52,6 +52,7 @@ _HEX32_RE = re.compile(r"[0-9a-f]{32}")
 # 进程内状态（测试经 reset_for_test 清理）
 _summaries: "dict | None" = None      # {"cards": [...], "saved_at": 单调钟}
 _fail_until: float = 0.0
+_fail_from_transport: bool = False
 _tracks_cache: "dict[str, tuple[list, float]]" = {}
 _tracks_order: list[str] = []         # LRU 顺序（旧 → 新）
 _load_tasks: "dict[str, asyncio.Task]" = {}
@@ -278,16 +279,21 @@ def _iter_known_cards() -> list:
 async def peek_summaries(client: httpx.AsyncClient) -> list:
     """网易账号自建歌单卡片（热门推荐与官方歌单之间注入用）。
 
-    成功 → 内存 TTL 5 分钟 + 落盘；失败 / 未登录 → 冷却 2 分钟并回落磁盘
-    （24h 内）；任何异常都只返回 []，绝不影响官方列表响应。
+    成功 → 内存 TTL 5 分钟 + 落盘；网络失败 → 冷却 2 分钟并回落磁盘
+    （24h 内）。未登录不回放磁盘。任何异常都只返回列表，绝不影响官方列表响应。
     """
-    global _summaries, _fail_until, _disk_cards
+    global _summaries, _fail_until, _disk_cards, _fail_from_transport
     now = time.monotonic()
     cached = _summaries
     if cached and now - cached["saved_at"] < _SUMMARY_TTL_S:
         return list(cached["cards"])
     if now < _fail_until:
-        return list((cached or {}).get("cards") or [])
+        mem_cards = list((cached or {}).get("cards") or [])
+        if mem_cards:
+            return mem_cards
+        if _fail_from_transport:
+            return list(_load_disk_summaries())
+        return []
     try:
         r = await client.get(
             "/api/v1/user/playlists", params={"limit": _MAX_PLAYLISTS}, timeout=_FETCH_TIMEOUT_S
@@ -298,11 +304,13 @@ async def peek_summaries(client: httpx.AsyncClient) -> list:
     except Exception as e:
         logger.debug("nm summaries fetch failed: %s", e)
         _fail_until = now + _FAIL_COOLDOWN_S
+        _fail_from_transport = True
         return list(_load_disk_summaries())
     if not (isinstance(data, dict) and data.get("ok") is True):
         # 未登录等结构化错误：静默跳过 + 冷却
         logger.debug("nm summaries not ok: %.120s", data)
         _fail_until = now + _FAIL_COOLDOWN_S
+        _fail_from_transport = False
         return list((cached or {}).get("cards") or [])
     try:
         uid = int(data.get("account_uid") or 0)
@@ -329,6 +337,7 @@ async def peek_summaries(client: httpx.AsyncClient) -> list:
             if pid and _cover_urls.get(pid):
                 new_covers[pid] = _cover_urls[pid]
     _fail_until = 0.0
+    _fail_from_transport = False
     _summaries = {"cards": cards, "saved_at": now}
     _disk_cards = None  # 内存新数据已覆盖，磁盘视图按需重读
     if cards:
@@ -469,9 +478,10 @@ def schedule_prefetch(client: httpx.AsyncClient, build_track, cards: list) -> No
 
 def reset_for_test() -> None:
     """清空全部进程内状态（测试隔离用）。"""
-    global _summaries, _fail_until, _disk_cards
+    global _summaries, _fail_until, _disk_cards, _fail_from_transport
     _summaries = None
     _fail_until = 0.0
+    _fail_from_transport = False
     _disk_cards = None
     _tracks_cache.clear()
     _tracks_order.clear()

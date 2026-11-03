@@ -80,6 +80,7 @@ _CHART_MAP: dict[str, dict[str, Any]] = {c["id"]: c for c in ALL_CHARTS}
 _MEM_CACHE: dict[str, tuple[float, str, list[dict]]] = {}
 _FETCH_FAIL_AT: dict[str, float] = {}
 _FETCH_FAIL_TTL_S = 600.0
+_CHART_FRESH_S = 14400.0
 _FETCH_LOCKS: dict[str, asyncio.Lock] = {}
 _CHART_COVERS: dict[str, str] = {}
 _CHART_TRACKS_BY_GUID: dict[str, dict] = {}
@@ -185,24 +186,39 @@ def _load_chart_file(chart_id: str, path: str) -> list[dict] | None:
     return tracks
 
 
+def _file_mtime(path: str) -> float | None:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
 def load_chart_cache(chart_id: str, day: str, *, allow_stale: bool = True) -> list[dict] | None:
-    """读取榜单缓存。只有当天数据能挡住重新拉取；历史文件只在抓取失败时兜底。"""
+    """读取榜单缓存。当天且未超过新鲜期的数据才挡住重新拉取；更旧的只做失败兜底。"""
+    now = time.time()
     mem = _MEM_CACHE.get(chart_id)
     if mem:
         ts, mem_day, data = mem
-        if mem_day == day and data and time.time() - ts < 14400:
+        if mem_day == day and data and now - ts < _CHART_FRESH_S:
             _index_tracks(data)
             return data
 
     today_path = _cache_file(chart_id, day)
+    today_tracks = None
+    today_mtime = None
     if os.path.exists(today_path):
         today_tracks = _load_chart_file(chart_id, today_path)
-        if today_tracks:
-            _MEM_CACHE[chart_id] = (time.time(), day, today_tracks)
+        today_mtime = _file_mtime(today_path)
+        if today_tracks and today_mtime is not None and now - today_mtime < _CHART_FRESH_S:
+            _MEM_CACHE[chart_id] = (today_mtime, day, today_tracks)
             return today_tracks
 
     if not allow_stale:
         return None
+
+    if today_tracks:
+        _MEM_CACHE[chart_id] = (today_mtime or now - _CHART_FRESH_S, day, today_tracks)
+        return today_tracks
 
     if mem and mem[2]:
         _index_tracks(mem[2])
@@ -389,6 +405,8 @@ async def fetch_wy_chart(
         if not sid:
             continue
         title = str(it.get("name") or "").strip()
+        if not title:
+            continue
         artists = it.get("artists") or it.get("ar") or []
         artist = " / ".join(str(a.get("name") or "") for a in artists if isinstance(a, dict))
         album_data = it.get("album") or it.get("al") or {}
@@ -559,7 +577,8 @@ async def warmup_charts_background(enabled_charts: list[dict[str, Any]], netease
                 # 若今日缓存已存在且在内存，跳过
                 mem = _MEM_CACHE.get(cid)
                 target_path = _cache_file(cid, day)
-                if mem and mem[1] == day and os.path.exists(target_path):
+                fresh = bool(mem and mem[1] == day and time.time() - mem[0] < _CHART_FRESH_S)
+                if fresh and os.path.exists(target_path):
                     continue
                 try:
                     await get_or_load_chart_tracks(cid, client=client, netease_enabled=netease_enabled)

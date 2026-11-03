@@ -1005,6 +1005,56 @@ async def fetch_lx_charts(client: httpx.AsyncClient, limit: int, sources: "list[
     return out
 
 
+_VERSION_MARKERS = (
+    "live", "remix", "cover", "acoustic", "instrumental", "inst",
+    "radio", "edit", "version", "ver", "mix", "dj",
+    "伴奏", "现场", "翻唱", "原唱", "纯音乐", "版",
+)
+_ARTIST_SPLIT = re.compile(r"\s*(?:/|、|&|\||,|，|;|；| feat\.? | ft\.? )\s*", re.I)
+
+
+def song_match_key(value: str) -> str:
+    text_value = re.sub(r"[（(].*?[)）]", "", str(value or "").lower())
+    text_value = re.sub(r"[\s\u3000]+", "", text_value)
+    return re.sub(r"[^\w\u4e00-\u9fff]+", "", text_value)
+
+
+def titles_compatible(wanted: str, got: str) -> bool:
+    """歌名必须相同，或只多了现场/伴奏这类版本标记。不能靠任意子串当成同一首。"""
+    left = song_match_key(wanted)
+    right = song_match_key(got)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    short, long = (left, right) if len(left) <= len(right) else (right, left)
+    if len(short) < 2 or not long.startswith(short):
+        return False
+    extra = long[len(short):]
+    return any(marker in extra for marker in _VERSION_MARKERS)
+
+
+def artist_tokens(value: str) -> set[str]:
+    out: set[str] = set()
+    for part in _ARTIST_SPLIT.split(str(value or "")):
+        key = song_match_key(part)
+        if len(key) >= 2:
+            out.add(key)
+    return out
+
+
+def artists_compatible(wanted: str, got: str) -> bool:
+    left = artist_tokens(wanted)
+    right = artist_tokens(got)
+    if not left or not right:
+        return True
+    return bool(left & right)
+
+
+def same_song(wanted_title: str, wanted_artist: str, got_title: str, got_artist: str = "") -> bool:
+    return titles_compatible(wanted_title, got_title) and artists_compatible(wanted_artist, got_artist)
+
+
 def _match_score(item: dict, title: str, artist: str) -> int:
     it = str(item.get("title") or item.get("name") or "").strip().lower()
     ia = str(item.get("artist") or "").strip().lower()
@@ -1030,6 +1080,8 @@ async def _search_keyword(
     lx_client: httpx.AsyncClient | None = None,
     lx_enabled: bool = False,
     lx_sources: "list[str] | None" = None,
+    title: str = "",
+    artist: str = "",
 ) -> list[dict]:
     async def _mb() -> list[dict]:
         if not (netease_enabled and musicbox_client):
@@ -1132,19 +1184,35 @@ async def _search_keyword(
             return []
 
     jobs = [asyncio.create_task(coro) for coro in (_mb(), _mdl(), _lx())]
+    collected: list[dict] = []
     try:
-        for fut in asyncio.as_completed(jobs):
-            try:
-                items = await fut
-            except Exception:
+        pending = set(jobs)
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for fut in done:
+                try:
+                    items = fut.result() or []
+                except Exception:
+                    items = []
+                collected.extend(item for item in items if isinstance(item, dict))
+            if not title:
+                if collected:
+                    break
                 continue
-            if items:
-                return items
-        return []
+            if any(
+                same_song(
+                    title, artist,
+                    str(item.get("title") or item.get("name") or ""),
+                    str(item.get("artist") or ""),
+                )
+                for item in collected
+            ):
+                break
+        return collected
     finally:
-        for t in jobs:
-            if not t.done():
-                t.cancel()
+        for task in jobs:
+            if not task.done():
+                task.cancel()
 
 
 async def verify_track_playable(
@@ -1262,14 +1330,24 @@ async def resolve_recommendations(
             items = await _search_keyword(
                 keyword, musicdl_client, musicbox_client, netease_enabled,
                 lx_client=lx_client, lx_enabled=lx_enabled, lx_sources=lx_sources,
+                title=title, artist=artist,
             )
-        if not items and artist:
+        def _usable(rows: list) -> bool:
+            if not title:
+                return bool(rows)
+            return any(
+                same_song(title, artist, str(it.get("title") or it.get("name") or ""), str(it.get("artist") or ""))
+                for it in rows
+                if isinstance(it, dict)
+            )
+        if not _usable(items) and artist:
             async with sem:
                 if interval > 0:
                     await asyncio.sleep(interval)
                 items = await _search_keyword(
                     artist, musicdl_client, musicbox_client, netease_enabled,
                     lx_client=lx_client, lx_enabled=lx_enabled, lx_sources=lx_sources,
+                    title=title, artist=artist,
                 )
         if not items:
             return []
@@ -1283,6 +1361,8 @@ async def resolve_recommendations(
             guid = f"online:{pid}" if pid and not str(pid).startswith("online:") else pid
             ptitle = str(pick.get("title") or pick.get("name") or "")
             partist = str(pick.get("artist") or "")
+            if title and not same_song(title, artist, ptitle, partist):
+                continue
             if _excluded(guid, ptitle, partist) or _excluded(pid, ptitle, partist):
                 continue
             track = build_track(pick)
