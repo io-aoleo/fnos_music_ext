@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from proxy import recommend as dailyrec
-from proxy.app import CONF, _DAILY_TASKS, _SEARCH_CACHE, app, _conf_log_value, fake_official_guid
+from proxy.app import CONF, _DAILY_TASKS, _SEARCH_CACHE, app, _cache_online_track, _conf_log_value, fake_official_guid
 from proxy.app import resolve_real_guid
 
 
@@ -1689,3 +1689,60 @@ def test_playlist_list_does_not_double_count_echoed_recommend(tmp_path, monkeypa
     assert "localpl" in guids
     assert data["total"] == len(data["list"]) == 2
 
+
+
+def test_event_report_fills_title_from_track_cache(tmp_path, monkeypatch):
+    """播放上报只有 guid 时，用已经缓存的曲目信息补歌名，而不是留下空标题。"""
+    monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", str(tmp_path / "ph"))
+    _cache_online_track("online:migu:42", {
+        "title": "稻香", "artist": "周杰伦", "album": "魔杰座", "duration_s": 223,
+    })
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_auth_user()), base_url="http://unix",
+    )
+    with TestClient(app) as client:
+        resp = client.post(
+            "/music/api/v1/event/report",
+            json={"events": [{"eventType": "track_play", "occurredAt": 1, "payload": {"trackGUID": "online:migu:42"}}]},
+        )
+        assert resp.json()["code"] == 0
+    items = dailyrec.load_online_play_history("user-rec-1")
+    assert items[-1]["track"]["title"] == "稻香"
+    assert items[-1]["track"]["artist"] == "周杰伦"
+
+
+
+def test_event_report_duration_ms_is_milliseconds(tmp_path, monkeypatch):
+    """durationMs 是毫秒。8 秒不能因为小于 10000 被记成 8000 秒。"""
+    monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", str(tmp_path / "ph"))
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_auth_user()), base_url="http://unix",
+    )
+    with TestClient(app) as client:
+        resp = client.post(
+            "/music/api/v1/event/report",
+            json={"events": [{"eventType": "track_play", "occurredAt": 1, "payload": {
+                "trackGUID": "online:migu:7", "title": "短曲", "artist": "某人", "durationMs": 8000,
+            }}]},
+        )
+        assert resp.json()["code"] == 0
+    items = dailyrec.load_online_play_history("user-rec-1")
+    assert items[-1]["track"]["duration_s"] == 8
+
+
+def test_play_history_list_fills_blank_title_from_cache(tmp_path, monkeypatch):
+    """已经落盘的空标题，打开历史时从曲目缓存补歌名。"""
+    monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", str(tmp_path / "ph"))
+    dailyrec.record_online_play("user-rec-1", "online:migu:42", {"guid": "online:migu:42"})
+    _cache_online_track("online:migu:42", {
+        "title": "稻香", "artist": "周杰伦", "album": "魔杰座", "duration_s": 223,
+    })
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_auth_user()), base_url="http://unix",
+    )
+    with TestClient(app) as client:
+        resp = client.get("/music/api/v1/play-history/list")
+    rows = resp.json()["data"]["list"]
+    row = next(x for x in rows if x["guid"] == fake_official_guid("online:migu:42"))
+    assert row["title"] == "稻香"
+    assert row["artists"][0]["name"] == "周杰伦"

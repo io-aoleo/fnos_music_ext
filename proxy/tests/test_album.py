@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from proxy import recommend as dailyrec
 from proxy.app import (
+    _row_duration_seconds,
     CONF,
     _FAKE_ALBUM_REGISTRY,
     _SEARCH_CACHE,
@@ -351,3 +352,11 @@ def test_persist_flag_not_set_for_track_derived_albums(monkeypatch, tmp_path):
     build_online_track({"id": "netease:42", "source": "netease", "title": "晴天", "artist": "周杰伦",
                         "album": "叶惠美", "duration_s": 269, "ext": "flac"})
     assert not reg_path.exists(), "未标 persist 的登记不应触发写盘"
+
+
+def test_short_netease_track_duration_is_seconds():
+    """dt 是毫秒。8 秒不能因为小于 10000 被当成 8000 秒。"""
+    assert _row_duration_seconds({"dt": 8000}) == 8
+    assert _row_duration_seconds({"duration": 269}) == 269
+    assert _row_duration_seconds({"duration": 269000}) == 269
+    assert _row_duration_seconds({"duration": 269, "dt": 269000}) == 269

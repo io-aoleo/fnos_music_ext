@@ -296,3 +296,24 @@ def test_transport_cooldown_keeps_disk_cards():
     nmpl._fail_until = time.monotonic() + 60
     assert asyncio.run(nmpl.peek_summaries(None)) == []
 
+
+
+
+def test_nm_playlist_heart_follows_current_user(tmp_path, monkeypatch):
+    """网易歌单红心按当前用户的在线收藏重算，不沿用抓取时的默认值。"""
+    monkeypatch.setitem(CONF, "music_db", str(tmp_path / "missing.db"))
+    proxy_app._OFFICIAL_FAV_CACHE.clear()
+    proxy_app.save_online_favorites("user-nm-1", [{
+        "guid": "online:netease:101",
+        "createdAt": 1,
+        "track": {"title": "晴天", "artist": "周杰伦"},
+    }])
+    _wire(_musicbox_handler(rows=PLAYLIST_ROWS, tracks=TRACK_ROWS))
+    with TestClient(app) as client:
+        resp = client.get(
+            "/music/api/v1/track/playlist-detail/list",
+            params={"playlistGUID": "online:playlist:nm:111", "page": 1, "size": -1},
+        )
+    assert resp.status_code == 200
+    hearts = {it["title"]: it["isFavorite"] for it in resp.json()["data"]["list"]}
+    assert hearts == {"晴天": True, "七里香": False}

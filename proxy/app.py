@@ -3658,7 +3658,8 @@ async def search_track(request: Request):
     merged = merge_online_tracks(upstream_json, selected, page=1, size=size, selected=True)
     merged["data"]["total"] = original_total + total_online
     fav_set = await _online_favorite_set(request)
-    _, db_paths, db_tags = official_favorites_cache()
+    fav_user = str(getattr(request.state, "fn_user_guid", "") or "")
+    _, db_paths, db_tags = official_favorites_cache(fav_user)
     if isinstance(merged.get("data"), dict) and isinstance(merged["data"].get("list"), list):
         for it in merged["data"]["list"]:
             if isinstance(it, dict):
@@ -3666,15 +3667,22 @@ async def search_track(request: Request):
                 t_path = (it.get("audioSpec") or {}).get("path") or ""
                 t_title = it.get("title") or ""
                 t_artist = (it.get("artist") or {}).get("name") if isinstance(it.get("artist"), dict) else (it.get("artist") or "")
-                if is_online_track_favorited(
+                real = resolve_real_guid(tg)
+                fav = is_online_track_favorited(
                     guid=tg,
+                    user_guid=fav_user,
                     cached_path=t_path,
                     title=t_title,
                     artist=str(t_artist or ""),
                     online_fav_set=fav_set,
                     official_fav_paths=db_paths,
                     official_fav_tags=db_tags,
-                ):
+                )
+                # 在线条目以本次判断为准，避免先按全库红心点亮后再盖不掉。
+                # 官方条目只补 True，不把上游已经给的红心清掉。
+                if is_online_guid(real) or is_online_guid(tg):
+                    it["isFavorite"] = fav
+                elif fav:
                     it["isFavorite"] = True
     return JSONResponse(content=disguise_client_json(merged), status_code=upstream_resp.status_code, headers=resp_headers)
 
@@ -5686,25 +5694,36 @@ def _forget_bind_playlist(user_guid: str, playlist_guid: str) -> None:
         _persist_bind_registry()
 
 
-def _lookup_bind_any_user(raw_guid: str) -> "tuple[str, str, dict] | None":
-    """跨用户按在线 guid 或其伪装 32hex 形态反查绑定登记。
+def _deterministic_fake_guid(real_guid: str) -> str:
+    """伪装 id 的纯计算。反查时不能走 fake_official_guid，否则每次比对都会写注册表。"""
+    return hashlib.md5(f"fnmusic-ext::{real_guid}".encode()).hexdigest()
 
-    返回 (user_guid, online_guid, entry)。官方绑定完成后本地映射已删、伪装
-    反查表可能不再认识该 id，这里兜底直接比对确定性 md5。
+
+def _lookup_user_bind(user_guid: str, raw_guid: str) -> "tuple[str, dict] | None":
+    """只在当前用户的登记里反查在线 guid 或伪装 id。
+
+    反查表冷掉后仍按确定性 md5 命中。不能跨用户取第一条：后绑定的账号
+    取消收藏会落空，伪装 id 也对不上自己的官方条目。
+    返回 (online_guid, entry)。
     """
     _ensure_bind_registry()
     raw = str(raw_guid or "").strip()
-    if not raw or not _bind_registry:
+    if not raw or not user_guid:
+        return None
+    entries = _bind_registry.get(user_guid) or {}
+    if not entries:
         return None
     resolved = resolve_real_guid(raw)
-    for user, entries in _bind_registry.items():
-        if is_online_guid(resolved) and resolved in entries:
-            return user, resolved, dict(entries[resolved])
-    if re.fullmatch(r"[0-9a-fA-F]{32}", raw):
-        for user, entries in _bind_registry.items():
-            for g, entry in entries.items():
-                if fake_official_guid(g) == raw:
-                    return user, g, dict(entry)
+    if is_online_guid(resolved) and resolved in entries and isinstance(entries[resolved], dict):
+        return resolved, dict(entries[resolved])
+    wanted = {h.lower() for h in re.findall(r"[0-9a-fA-F]{32}", raw)}
+    if not wanted:
+        return None
+    for online_guid, entry in entries.items():
+        if not isinstance(entry, dict):
+            continue
+        if _deterministic_fake_guid(online_guid) in wanted:
+            return online_guid, dict(entry)
     return None
 
 
@@ -6266,12 +6285,12 @@ async def _online_info(request: Request, guid: str, include_lyric: bool = True) 
         return retained
     try:
         data = await asyncio.wait_for(_fetch_online_info(request, guid, include_lyric=include_lyric), timeout=4.0)
-        if data:
+        if data and str(data.get("title") or data.get("name") or "").strip():
             _cache_online_track(guid, data)
             return data
         if await _recover_source(request, guid, entry):
             data = await asyncio.wait_for(_fetch_online_info(request, guid, include_lyric=include_lyric), timeout=3.0)
-            if data:
+            if data and str(data.get("title") or data.get("name") or "").strip():
                 _cache_online_track(guid, data)
                 return data
     except Exception:
@@ -6365,6 +6384,10 @@ async def _fetch_online_info(request: Request, guid: str, include_lyric: bool = 
                                         lyric_text = str((l_res.get("data") or {}).get("lyric") or "").strip()
                             except Exception as l_err:
                                 logger.warning("lxmusic lyric fetch failed for %s: %s", guid, l_err)
+                        # track/info 在缓存未命中时会回一个标题为空的占位。把它当成
+                        # 真元数据会把空歌名写进内存，后面的收藏和歌词都拿不到曲名。
+                        if not str(inner.get("title") or inner.get("name") or "").strip():
+                            return None
                         return {
                             "id": song_id,
                             "source": "lx",
@@ -6448,7 +6471,7 @@ async def track_metadata(request: Request, subpath: str = ""):
     if not is_authed:
         user_guid = "shared"
     online_favs = await _online_favorite_set(request)
-    _, db_paths, db_tags = official_favorites_cache()
+    _, db_paths, db_tags = official_favorites_cache(user_guid)
 
     vo = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     t_path = (vo.get("audioSpec") or {}).get("path") or ""
@@ -7161,35 +7184,55 @@ async def _probe_upstream_auth(request: Request, client: httpx.AsyncClient) -> t
                 if isinstance(probe_json, dict) and probe_json.get("code") == 0:
                     data = probe_json.get("data")
                     if isinstance(data, dict) and data.get("guid"):
-                        return True, str(data["guid"]), None
+                        guid = str(data["guid"])
+                        request.state.fn_user_guid = guid
+                        return True, guid, None
                     logger.warning("user/me response missing data.guid, falling back to 'shared': %s", probe_json)
+                    request.state.fn_user_guid = "shared"
                     return True, "shared", None
             except Exception as e:
                 logger.warning("Failed to parse user/me json response: %s", e)
+                request.state.fn_user_guid = "shared"
                 return True, "shared", None
+            request.state.fn_user_guid = "shared"
             return True, "shared", None
 
         # 其他非 200/401 状态码，上游异常
+        request.state.fn_user_guid = "shared"
         return True, "shared", None
     except Exception as e:
         logger.warning("Upstream auth probe failed: %s", e)
         # 探测异常时保守放行
+        request.state.fn_user_guid = "shared"
         return True, "shared", None
 
 
-_OFFICIAL_FAV_CACHE: "tuple[float, set[str], set[str], set[tuple[str, str]]]" = (0.0, set(), set(), set())
+_OFFICIAL_FAV_CACHE: "dict[str, tuple[float, set[str], set[str], set[tuple[str, str]]]]" = {}
 _OFFICIAL_FAV_TTL_S = 5.0
 
 
-def official_favorites_cache() -> "tuple[set[str], set[str], set[tuple[str, str]]]":
-    global _OFFICIAL_FAV_CACHE
+def official_favorites_cache(user_guid: str = "") -> "tuple[set[str], set[str], set[tuple[str, str]]]":
+    """Official favorite guids, paths and tags.
+
+    A known user only sees that user's rows. If that guid is not in music.db,
+    return empty instead of every account's favorites. Callers with no user
+    yet keep the library-wide read.
+    """
+    key = str(user_guid or "")
     now = time.monotonic()
-    last_t, guids, paths, tags = _OFFICIAL_FAV_CACHE
-    if now - last_t < _OFFICIAL_FAV_TTL_S:
-        return guids, paths, tags
+    hit = _OFFICIAL_FAV_CACHE.get(key)
+    if hit and now - hit[0] < _OFFICIAL_FAV_TTL_S:
+        return hit[1], hit[2], hit[3]
+    empty = (set(), set(), set())
     db = str(CONF.get("music_db") or "")
     if not db or not os.path.exists(db):
-        return set(), set(), set()
+        return empty
+    uid = None
+    if key:
+        uid = dailyrec.user_id_from_guid(db, key)
+        if uid is None:
+            _OFFICIAL_FAV_CACHE[key] = (now, set(), set(), set())
+            return empty
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         cur = con.cursor()
@@ -7200,7 +7243,11 @@ def official_favorites_cache() -> "tuple[set[str], set[str], set[tuple[str, str]
             "LEFT JOIN track_artist ta ON ta.track_id = t.id "
             "LEFT JOIN artist ar ON ar.id = ta.artist_id"
         )
-        rows = cur.execute(sql1).fetchall()
+        params = ()
+        if uid is not None:
+            sql1 += " WHERE ft.user_id = ?"
+            params = (uid,)
+        rows = cur.execute(sql1, params).fetchall()
         guids = set()
         paths = set()
         tags = set()
@@ -7216,12 +7263,11 @@ def official_favorites_cache() -> "tuple[set[str], set[str], set[tuple[str, str]
             if t_name and a_name:
                 tags.add((t_name, a_name))
         con.close()
-        _OFFICIAL_FAV_CACHE = (now, guids, paths, tags)
+        _OFFICIAL_FAV_CACHE[key] = (now, guids, paths, tags)
         return guids, paths, tags
     except Exception as e:
         logger.debug("Failed to query official favorites: %s", e)
-        return set(), set(), set()
-
+        return empty
 
 def is_online_track_favorited(
     guid: str,
@@ -7248,19 +7294,16 @@ def is_online_track_favorited(
         except Exception:
             pass
 
-    # 2. 检查转正登记表（即使在线收藏条目已删，转正记录里仍保留了该在线 guid 的收藏状态）
+    # 只认当前用户的转正登记。别的账号收藏过同一首时不能把红心点亮，
+    # 否则取消收藏会顺着跨用户反查把别人的绑定删掉。
     if user_guid:
         for g in (guid, real_guid):
             bind_entry = lookup_bind_entry(user_guid, g)
             if bind_entry and bind_entry.get("fav"):
                 return True
-    for g in (guid, real_guid):
-        any_bind = _lookup_bind_any_user(g)
-        if any_bind and any_bind[2].get("fav"):
-            return True
 
-    # 3. 检查官方曲库收藏 guid
-    db_guids, db_paths, db_tags = official_favorites_cache()
+    # 官方曲库收藏：有用户时按 user_id 过滤
+    db_guids, db_paths, db_tags = official_favorites_cache(user_guid)
     if guid in db_guids or real_guid in db_guids:
         return True
 
@@ -7341,11 +7384,17 @@ async def _resolve_kg_hash_meta(hash_val: str) -> dict:
                     artist = str(c0.get("singer") or "").strip()
                     lyric_id = str(c0.get("id") or "").strip()
                     access_key = str(c0.get("accesskey") or "").strip()
+                    try:
+                        raw_dur = float(c0.get("duration") or 0)
+                    except (TypeError, ValueError):
+                        raw_dur = 0.0
+                    # KRCS duration is milliseconds.
+                    duration_s = raw_dur / 1000.0 if raw_dur >= 1000 else raw_dur
                     return {
                         "title": title,
                         "artist": artist,
                         "album": "",
-                        "duration_s": 0.0,
+                        "duration_s": duration_s,
                         "kg_lyric_id": lyric_id,
                         "kg_accesskey": access_key,
                     }
@@ -7384,8 +7433,10 @@ async def _best_effort_online_info(request: Request, guid: str) -> dict:
     artist = str((info or {}).get("artist") or "").strip()
     album = str((info or {}).get("album") or "").strip()
     duration_s = float((info or {}).get("duration_s") or 0.0)
+    cached_lyric = read_lyric_cache(guid) or ""
 
-    # 酷狗曲目特异性保底反查：有 hash 即能查到完整元数据
+    # 酷狗曲目保底反查。歌词变量必须先赋值：原先在分支里先读后写，
+    # 曲名还没进缓存时收藏/加歌单会抛 UnboundLocalError。
     if not title and guid.startswith("online:lx:kg:"):
         kg_hash = guid.split(":")[-1]
         kg_meta = await _resolve_kg_hash_meta(kg_hash)
@@ -7404,8 +7455,6 @@ async def _best_effort_online_info(request: Request, guid: str) -> dict:
                         write_lyric_cache(guid, krcs_lrc, title=title, artist=artist)
                 except Exception:
                     pass
-
-    cached_lyric = read_lyric_cache(guid)
     cached_media = find_cache_file(guid)
     if cached_media and not title:
         base = os.path.splitext(os.path.basename(cached_media))[0]
@@ -7598,17 +7647,30 @@ async def favorite_track_delete(request: Request):
     )
 
     if not online_guids:
-        for raw in candidates:
-            hit = _lookup_bind_any_user(raw)
-            if hit and hit[2].get("fav"):
-                bound_user, bound_guid, entry = hit
+        is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+        if is_authed:
+            for raw in candidates:
+                hit = _lookup_user_bind(user_guid, raw)
+                if not (hit and hit[1].get("fav")):
+                    continue
+                bound_guid, entry = hit
                 ok = await _official_upstream_write(
                     "POST", "/music/api/v1/favorite-track/delete",
-                    copy_incoming_headers(request), {"trackGUID": entry["official"]},
+                    copy_incoming_headers(request), {"trackGUID": entry.get("official") or ""},
                 )
                 if ok:
-                    _forget_bind(bound_user, bound_guid, fav=True)
+                    _forget_bind(user_guid, bound_guid, fav=True)
+                async with _FAV_LOCK:
+                    try:
+                        items = load_online_favorites(user_guid)
+                        kept = [it for it in items if it.get("guid") != bound_guid]
+                        if len(kept) != len(items):
+                            save_online_favorites(user_guid, kept)
+                    except Exception as e:
+                        logger.warning("Error deleting stale favorite for user %s: %s", user_guid, e)
                 return JSONResponse(content={"code": 0, "msg": "", "data": None})
+        elif auth_resp is not None:
+            return auth_resp
         return await forward_to_upstream(request, upstream_client)
 
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
@@ -8087,22 +8149,48 @@ async def playlist_remove_track(request: Request):
     if nmpl.is_nm_playlist_guid(playlist_guid):
         return JSONResponse(content={"code": 0, "msg": "", "data": None})
 
-    online = [g for g in (resolve_real_guid(g) for g in track_guids) if is_online_guid(g)]
+    resolved_pairs = [(raw, resolve_real_guid(raw)) for raw in track_guids]
+    online: list[str] = []
+    for _raw, resolved in resolved_pairs:
+        if is_online_guid(resolved) and resolved not in online:
+            online.append(resolved)
+
+    # 反查表冷掉时，伪装 id 解不出 online guid。没有绑定登记就不必探测身份。
+    # 只翻译当前用户自己的绑定，翻译不到则保持原样转发给官方。
+    _ensure_bind_registry()
+    if not online and not _bind_registry:
+        return await forward_to_upstream(request, upstream_client)
+    is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+    translated: set[str] = set()
+    if is_authed:
+        for raw, resolved in resolved_pairs:
+            if is_online_guid(resolved):
+                continue
+            hit = _lookup_user_bind(user_guid, raw)
+            if hit and playlist_guid in (hit[1].get("playlists") or []):
+                translated.add(raw)
+                if hit[0] not in online:
+                    online.append(hit[0])
     if not online:
         return await forward_to_upstream(request, upstream_client)
-
-    is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
     if not is_authed and auth_resp is not None:
         return auth_resp
 
-    official = [g for g in (resolve_real_guid(g) for g in track_guids) if not is_online_guid(g)]
+    official: list[str] = []
+    for raw, resolved in resolved_pairs:
+        if raw in translated or is_online_guid(resolved):
+            continue
+        if resolved not in official:
+            official.append(resolved)
     # 旧会话假 id 中已完成官方绑定的：翻译成官方 guid 一并从官方歌单移除
     bound_pairs: "list[tuple[str, str]]" = []
     for g in online:
         entry = lookup_bind_entry(user_guid, g)
         if entry and playlist_guid in (entry.get("playlists") or []):
             bound_pairs.append((g, str(entry.get("official") or "")))
-    official += [og for _, og in bound_pairs if og]
+    for _g, og in bound_pairs:
+        if og and og not in official:
+            official.append(og)
     if official:
         err = await _forward_official_playlist_tracks(request, upstream_client, "remove-track", playlist_guid, official)
         if err is not None:
@@ -8453,6 +8541,26 @@ async def playlist_track_list(request: Request):
             size = 50
         start = (page - 1) * size
         page_tracks = tracks[start:start + size]
+        online_favs = await _online_favorite_set(request)
+        fav_user = str(getattr(request.state, "fn_user_guid", "") or "") or (user_guid if is_authed else "")
+        _, db_paths, db_tags = official_favorites_cache(fav_user)
+        for trk in page_tracks:
+            if not isinstance(trk, dict):
+                continue
+            tg = trk.get("guid") or ""
+            t_path = (trk.get("audioSpec") or {}).get("path") or ""
+            t_title = trk.get("title") or ""
+            t_artist = (trk.get("artist") or {}).get("name") if isinstance(trk.get("artist"), dict) else (trk.get("artist") or "")
+            trk["isFavorite"] = is_online_track_favorited(
+                guid=str(tg),
+                user_guid=fav_user,
+                cached_path=t_path,
+                title=str(t_title or ""),
+                artist=str(t_artist or ""),
+                online_fav_set=online_favs,
+                official_fav_paths=db_paths,
+                official_fav_tags=db_tags,
+            )
         return JSONResponse(
             content=disguise_client_json({
                 "code": 0,
@@ -8493,7 +8601,7 @@ async def playlist_track_list(request: Request):
         # [official_total, official_total+len)；按请求页窗口切片，翻页不重不漏
         extras_sorted = sorted(extras, key=lambda x: x.get("addedAt", 0), reverse=True)
         online_favs = await _online_favorite_set(request)
-        _, db_paths, db_tags = official_favorites_cache()
+        _, db_paths, db_tags = official_favorites_cache(user_guid)
         template = official_track_template(official_list)
         online_objs = []
         for it in extras_sorted:
@@ -8569,7 +8677,8 @@ async def playlist_track_list(request: Request):
         page_tracks = charts.chart_track_page(tracks, page, size)
 
         online_favs = await _online_favorite_set(request)
-        _, db_paths, db_tags = official_favorites_cache()
+        fav_user = str(getattr(request.state, "fn_user_guid", "") or "")
+        _, db_paths, db_tags = official_favorites_cache(fav_user)
         for trk in page_tracks:
             tg = trk.get("guid") or ""
             t_path = (trk.get("audioSpec") or {}).get("path") or ""
@@ -8577,6 +8686,7 @@ async def playlist_track_list(request: Request):
             t_artist = (trk.get("artist") or {}).get("name") if isinstance(trk.get("artist"), dict) else (trk.get("artist") or "")
             trk["isFavorite"] = is_online_track_favorited(
                 guid=tg,
+                user_guid=fav_user,
                 cached_path=t_path,
                 title=t_title,
                 artist=str(t_artist or ""),
@@ -8618,7 +8728,7 @@ async def playlist_track_list(request: Request):
     page_tracks = tracks[start:start + size]
 
     online_favs = await _online_favorite_set(request)
-    _, db_paths, db_tags = official_favorites_cache()
+    _, db_paths, db_tags = official_favorites_cache(user_guid)
     for trk in page_tracks:
         tg = trk.get("guid") or ""
         t_path = (trk.get("audioSpec") or {}).get("path") or ""
@@ -8693,6 +8803,29 @@ def _album_detail_payload(album_guid: str, album_name: str, artist: str, tracks:
     return {"code": 0, "msg": "ok", "data": album_obj}
 
 
+def _row_duration_seconds(row: dict) -> float:
+    """网易 dt 永远是毫秒。duration 可能已经是秒，只有明显的毫秒值才再除。
+
+    8 秒的 dt=8000 不能再被当成秒，否则专辑曲目会显示成两个多小时。
+    """
+    if not isinstance(row, dict):
+        return 0.0
+    duration = row.get("duration")
+    dt = row.get("dt")
+    if duration in (None, "", 0) and dt not in (None, "", 0):
+        try:
+            return float(dt) / 1000.0
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        dur_f = float(duration or dt or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if dur_f > 10000:
+        return dur_f / 1000.0
+    return dur_f
+
+
 async def _netease_album_detail_payload(request: Request, entry: dict) -> dict | None:
     """netease 专辑：曲目详情解析真实专辑 ID，经 musicbox /api/v1/album/{id} 拉曲目列表。
 
@@ -8745,17 +8878,13 @@ async def _netease_album_detail_payload(request: Request, entry: dict) -> dict |
             continue
         title = str(row.get("song_name") or row.get("name") or "")
         artist = str(row.get("artist") or "") or _artist_names_joined(row)
-        try:
-            dur_f = float(row.get("duration") or row.get("dt") or 0)
-        except (TypeError, ValueError):
-            dur_f = 0.0
         items.append({
             "id": f"netease:{sid}",
             "source": "netease",
             "title": title,
             "artist": artist,
             "album": album_name,
-            "duration_s": dur_f / 1000.0 if dur_f > 10000 else dur_f,
+            "duration_s": _row_duration_seconds(row),
             "ext": "flac" if (row.get("has_sq") or row.get("sq") or row.get("has_hr")) else "mp3",
             "cover_url": cover_url,
         })
@@ -8916,6 +9045,28 @@ async def album_detail(request: Request, subpath: str = ""):
 
     payload = await _synthesize_album_payload(request, entry, raw_guid)
     if payload is not None:
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        tracks = data.get("tracks") if isinstance(data.get("tracks"), list) else []
+        online_favs = await _online_favorite_set(request)
+        fav_user = str(getattr(request.state, "fn_user_guid", "") or "")
+        _, db_paths, db_tags = official_favorites_cache(fav_user)
+        for trk in tracks:
+            if not isinstance(trk, dict):
+                continue
+            tg = trk.get("guid") or ""
+            t_path = (trk.get("audioSpec") or {}).get("path") or ""
+            t_title = trk.get("title") or ""
+            t_artist = (trk.get("artist") or {}).get("name") if isinstance(trk.get("artist"), dict) else (trk.get("artist") or "")
+            trk["isFavorite"] = is_online_track_favorited(
+                guid=str(tg),
+                user_guid=fav_user,
+                cached_path=t_path,
+                title=str(t_title or ""),
+                artist=str(t_artist or ""),
+                online_fav_set=online_favs,
+                official_fav_paths=db_paths,
+                official_fav_tags=db_tags,
+            )
         return JSONResponse(content=disguise_client_json(payload))
     logger.info("album detail not synthesizable: source=%s album=%r guid=%s", entry.get("source"), entry.get("album"), raw_guid)
     return JSONResponse(content={"code": -1, "msg": "该音源暂不支持专辑详情", "data": None})
@@ -8945,7 +9096,8 @@ async def track_album_detail_list(request: Request):
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     tracks = list(data.get("tracks") or [])
     online_favs = await _online_favorite_set(request)
-    _, db_paths, db_tags = official_favorites_cache()
+    fav_user = str(getattr(request.state, "fn_user_guid", "") or "")
+    _, db_paths, db_tags = official_favorites_cache(fav_user)
     for trk in tracks:
         tg = trk.get("guid") or ""
         t_path = (trk.get("audioSpec") or {}).get("path") or ""
@@ -8953,6 +9105,7 @@ async def track_album_detail_list(request: Request):
         t_artist = (trk.get("artist") or {}).get("name") if isinstance(trk.get("artist"), dict) else (trk.get("artist") or "")
         trk["isFavorite"] = is_online_track_favorited(
             guid=tg,
+            user_guid=fav_user,
             cached_path=t_path,
             title=t_title,
             artist=str(t_artist or ""),
@@ -9230,10 +9383,20 @@ async def event_report(request: Request):
                         title = p_title or title
                         artist = p_artist or artist
                         album = p_album or album
-                        raw_dur = payload.get("duration") or payload.get("durationMs") or payload.get("duration_ms")
+                        raw_dur = payload.get("duration")
+                        raw_ms = payload.get("durationMs")
+                        if raw_ms in (None, ""):
+                            raw_ms = payload.get("duration_ms")
                         try:
-                            dv = float(raw_dur)
-                            duration_s = dv / 1000.0 if dv > 10000 else dv
+                            if raw_dur not in (None, "", 0):
+                                dv = float(raw_dur)
+                                duration_s = dv / 1000.0 if dv > 10000 else dv
+                            elif raw_ms not in (None, "", 0):
+                                # durationMs / duration_ms 单位就是毫秒。8 秒是 8000，
+                                # 不能再套「大于 10000 才除」否则会显示成两个多小时。
+                                duration_s = float(raw_ms) / 1000.0
+                            else:
+                                duration_s = None
                         except (TypeError, ValueError):
                             duration_s = None
                     retained = None
@@ -9257,6 +9420,18 @@ async def event_report(request: Request):
                                 title = title or s_title
                                 artist = artist or s_artist
                                 album = album or s_album
+                        if not title or not artist or not album:
+                            cached_t = _ONLINE_TRACK_CACHE.get(guid) or charts.find_track(guid)
+                            if cached_t:
+                                c_title, c_artist, c_album = _tag_fields(cached_t)
+                                title = title or c_title
+                                artist = artist or c_artist
+                                album = album or c_album
+                                if not duration_s:
+                                    try:
+                                        duration_s = float(cached_t.get("duration_s") or 0) or None
+                                    except (TypeError, ValueError):
+                                        duration_s = None
                     cached = find_cache_file(guid)
                     if cached and (not title or not artist):
                         base = os.path.splitext(os.path.basename(cached))[0]
@@ -9346,7 +9521,7 @@ async def play_history_list(request: Request):
     async with _HISTORY_LOCK:
         online_items = dailyrec.load_online_play_history(user_guid)
     online_favs = await _online_favorite_set(request)
-    _, db_paths, db_tags = official_favorites_cache()
+    _, db_paths, db_tags = official_favorites_cache(user_guid)
     template = official_track_template(official)
     online_tracks = []
     for it in reversed(online_items):
@@ -9369,6 +9544,23 @@ async def play_history_list(request: Request):
                     "ext": retained.get("ext") or "",
                     "cover_url": _cover_url_of(retained),
                 }
+            if not (info or {}).get("title"):
+                cached_t = _ONLINE_TRACK_CACHE.get(guid) or charts.find_track(guid)
+                if cached_t:
+                    c_title, c_artist, c_album = _tag_fields(cached_t)
+                    try:
+                        cached_dur = float(cached_t.get("duration_s") or 0)
+                    except (TypeError, ValueError):
+                        cached_dur = 0.0
+                    info = {
+                        **(info or {}),
+                        "title": c_title,
+                        "artist": c_artist or (info or {}).get("artist") or "",
+                        "album": c_album or (info or {}).get("album") or "",
+                        "duration_s": (info or {}).get("duration_s") or cached_dur or 0,
+                        "ext": (info or {}).get("ext") or cached_t.get("ext") or "",
+                        "cover_url": (info or {}).get("cover_url") or _cover_url_of(cached_t),
+                    }
         if info and not info.get("cover_url"):
             retained, _entry = _retained_track(request, guid)
             cov = _cover_url_of(retained) if retained else ""

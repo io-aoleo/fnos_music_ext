@@ -331,11 +331,11 @@ def search_web_fallback(keyword: str, stype: str = "song", limit: int = 20) -> l
             artist = str(s.get("artist") or "")
         album = s.get("album") or {}
         album_name = str(album.get("name") or "") if isinstance(album, dict) else str(s.get("album_name") or "")
+        # 网易 web 搜索的 duration 单位固定是毫秒。8 秒的 8000 不能因为
+        # 小于 10000 被当成 8000 秒。
         duration_raw = s.get("duration") or 0
         try:
-            dur = float(duration_raw)
-            if dur > 10000:
-                dur = dur / 1000.0
+            dur = float(duration_raw) / 1000.0
         except (ValueError, TypeError):
             dur = 0.0
 

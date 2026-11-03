@@ -380,6 +380,13 @@ def test_search_web_fallback_function(monkeypatch):
                     "artists": [{"id": 11127, "name": "Beyond"}],
                     "album": {"id": 78372827, "name": "精选系列"},
                     "duration": 239560,
+                },
+                {
+                    "id": 8,
+                    "name": "短曲",
+                    "artists": [{"id": 1, "name": "某人"}],
+                    "album": {"id": 1, "name": "短辑"},
+                    "duration": 8000,
                 }
             ],
             "songCount": 1,
@@ -405,12 +412,13 @@ def test_search_web_fallback_function(monkeypatch):
     monkeypatch.setattr(netease_ext, "httpx", type("MockHttpxMod", (), {"Client": MockHttpxClient}))
 
     items = netease_ext.search_web_fallback("海阔天空", stype="song", limit=5)
-    assert len(items) == 1
+    assert len(items) == 2
     assert items[0]["song_id"] == 1357375695
     assert items[0]["song_name"] == "海阔天空"
     assert items[0]["artist"] == "Beyond"
     assert items[0]["album_name"] == "精选系列"
     assert abs(items[0]["duration"] - 239.56) < 0.01
+    assert items[1]["duration"] == 8
 
 
 

@@ -431,3 +431,121 @@ def test_env_hot_reload_new_keys(tmp_path, monkeypatch):
     finally:
         os.environ.pop("FNMUSIC_OFFICIAL_BIND_TIMEOUT_S", None)
         os.environ.pop("FNMUSIC_TEE_HANDOFF_MAX", None)
+
+
+def test_other_user_favorite_bind_stays_private(env):
+    """A 的转正收藏不能点亮 B 的红心，B 取消收藏也不能拆掉 A 的绑定。"""
+    appmod._record_bind("user-a", FAKE_KUWO1, OFFICIAL_GUID)
+    assert appmod.is_online_track_favorited(FAKE_KUWO1, user_guid="user-a") is True
+    assert appmod.is_online_track_favorited(FAKE_KUWO1, user_guid="user-b") is False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/user/me"):
+            return httpx.Response(200, json={"code": 0, "msg": "ok", "data": {"guid": "user-b"}})
+        return httpx.Response(200, json={"code": 0, "msg": "", "data": None})
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://unix",
+    )
+    with TestClient(app) as client:
+        resp = client.post(
+            "/music/api/v1/favorite-track/delete",
+            json={"trackGUID": fake_official_guid(FAKE_KUWO1)},
+        )
+        assert resp.status_code == 200
+    assert appmod.lookup_bind_entry("user-a", FAKE_KUWO1) is not None
+    assert upstream_posts(env["upstream_calls"], "/favorite-track/delete") == []
+
+
+def test_stale_fake_unfavorite_stays_on_current_user(env):
+    """反查表冷掉、且 A 先绑定同一首时，B 取消收藏仍删自己的官方条目。"""
+    appmod._record_bind("user-a", FAKE_KUWO1, "official-a")
+    appmod._record_bind("user-b", FAKE_KUWO1, "official-b")
+    appmod.save_online_favorites("user-a", [{
+        "guid": FAKE_KUWO1, "createdAt": 1, "track": {"title": "晴天"},
+    }])
+    appmod.save_online_favorites("user-b", [{
+        "guid": FAKE_KUWO1, "createdAt": 1, "track": {"title": "晴天"},
+    }])
+    fake = fake_official_guid(FAKE_KUWO1)
+    appmod._FAKE_GUID_REVERSE.clear()
+    appmod._REGISTRY_WARMED = True
+
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = None
+        if request.content:
+            try:
+                body = json.loads(request.content)
+            except Exception:
+                body = None
+        calls.append((request.url.path, body))
+        if request.url.path.endswith("/user/me"):
+            return httpx.Response(200, json={"code": 0, "msg": "ok", "data": {"guid": "user-b"}})
+        return httpx.Response(200, json={"code": 0, "msg": "", "data": None})
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://unix",
+    )
+    with TestClient(app) as client:
+        resp = client.post(
+            "/music/api/v1/favorite-track/delete",
+            json={"trackGUID": fake.upper()},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["code"] == 0
+
+    deletes = [body for path, body in calls if path.endswith("/favorite-track/delete")]
+    assert deletes == [{"trackGUID": "official-b"}]
+    assert appmod.lookup_bind_entry("user-a", FAKE_KUWO1)["fav"] is True
+    assert appmod.lookup_bind_entry("user-b", FAKE_KUWO1) is None
+    assert [it["guid"] for it in appmod.load_online_favorites("user-a")] == [FAKE_KUWO1]
+    assert appmod.load_online_favorites("user-b") == []
+
+
+def test_stale_fake_playlist_remove_stays_on_current_user(env):
+    """反查表冷掉时，B 移出歌单不能拆掉 A 的绑定，也不能把伪装 id 原样丢给官方。"""
+    appmod._record_bind("user-a", FAKE_KUWO1, "official-a", playlist_guid=PL_CUSTOM)
+    appmod._record_bind("user-b", FAKE_KUWO1, "official-b", playlist_guid=PL_CUSTOM)
+    appmod.save_playlist_tracks("user-a", {
+        PL_CUSTOM: [{"guid": FAKE_KUWO1, "addedAt": 1, "track": {"title": "晴天"}}],
+    })
+    appmod.save_playlist_tracks("user-b", {
+        PL_CUSTOM: [{"guid": FAKE_KUWO1, "addedAt": 1, "track": {"title": "晴天"}}],
+    })
+    fake = fake_official_guid(FAKE_KUWO1)
+    appmod._FAKE_GUID_REVERSE.clear()
+    appmod._REGISTRY_WARMED = True
+
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = None
+        if request.content:
+            try:
+                body = json.loads(request.content)
+            except Exception:
+                body = None
+        calls.append((request.url.path, body))
+        if request.url.path.endswith("/user/me"):
+            return httpx.Response(200, json={"code": 0, "msg": "ok", "data": {"guid": "user-b"}})
+        return httpx.Response(200, json={"code": 0, "msg": "", "data": None})
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://unix",
+    )
+    with TestClient(app) as client:
+        resp = client.post(
+            "/music/api/v1/playlist/remove-track",
+            json={"guid": PL_CUSTOM, "trackGUIDs": [fake.upper()]},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["code"] == 0
+
+    removes = [body for path, body in calls if path.endswith("/playlist/remove-track")]
+    assert removes == [{"guid": PL_CUSTOM, "trackGUIDs": ["official-b"]}]
+    assert appmod.lookup_bind_entry("user-a", FAKE_KUWO1) is not None
+    assert appmod.lookup_bind_entry("user-b", FAKE_KUWO1) is None
+    assert [it["guid"] for it in appmod.load_playlist_tracks("user-a")[PL_CUSTOM]] == [FAKE_KUWO1]
+    assert PL_CUSTOM not in appmod.load_playlist_tracks("user-b")
